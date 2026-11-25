@@ -192,14 +192,34 @@ Client ──(:80/:443)──► Nginx (reverse proxy,          ┌──► Red
 
 ### Exercise 3.1 / 3.2: Deploy Agent Part 6 (`06-lab-complete/`) lên Cloud
 
-- **Nền tảng chính:** `[Đang chờ deploy ở CP6 — Render hoặc Railway]`
-- **Public URL:** `[Đang chờ URL sau khi deploy]`
-- **Redis trên cloud:** `[Đang chờ cấu hình REDIS_URL trên dashboard]`
+- **Nền tảng chính:** Railway (project `k5-day14-ai-agent`, gồm 2 service: `agent` build từ `06-lab-complete/Dockerfile` + `06-lab-complete/railway.toml` và `Redis` managed database).
+- **Public URL:** https://agent-production-1f93d101.up.railway.app
+- **Redis & Secrets trên cloud:** `REDIS_URL=${{Redis.REDIS_URL}}` (kết nối mạng nội bộ Railway), `AGENT_API_KEY` đặt qua `railway variable set --stdin` (không commit vào code/repo), kèm `PORT=8000`, `ENVIRONMENT=production`, `LOG_LEVEL=INFO`, `RATE_LIMIT_PER_MINUTE=10`, `DAILY_BUDGET_USD=1.0`, `MONTHLY_BUDGET_USD=10.0`.
+- **Chi tiết triển khai & lệnh test:** xem [DEPLOYMENT.md](DEPLOYMENT.md).
 - **Screenshots:**
   - [Deployment dashboard](screenshots/dashboard.png)
   - [Service running](screenshots/running.png)
   - [Test results](screenshots/test.png)
-- **Kết quả 4 lệnh tự kiểm CP6 (`/health` → 200, `/ready` → 200, `/ask` không key → 401, `/ask` có key → 200):** `[Sẽ dán ngay sau khi deploy xong]`
+- **Kết quả thực tế 4 lệnh tự kiểm CP6 (không lộ API key):**
+
+```bash
+$ BASE="https://agent-production-1f93d101.up.railway.app"
+$ curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/health"
+200
+$ curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/ready"
+200
+$ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" -H 'Content-Type: application/json' -d '{"question":"Hello"}'
+401
+$ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" -H 'Content-Type: application/json' -H "X-API-Key: $AGENT_API_KEY" -d '{"question":"Hello"}'
+200
+```
+
+- **Chi tiết JSON trả về thực tế:**
+  - `GET /health` (`200`): `{"status":"ok","environment":"production","uptime_seconds":22.0}`
+  - `GET /ready` (`200`): `{"status":"ready","redis":"connected"}`
+  - `POST /ask` không key (`401`): `{"detail":"Invalid or missing API key. Provide a valid X-API-Key header."}`
+  - `POST /ask` có `X-API-Key` (`200`): `{"question":"Hello","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận.","user_id":"test","usage":{"input_tokens":2,"output_tokens":30,"cost_usd":1.83e-05,"requests_remaining":9}}`
+  - `python check_production_ready.py --public-url https://agent-production-1f93d101.up.railway.app`: `✅ Public URL: GET https://agent-production-1f93d101.up.railway.app/health → 200`
 
 ### So sánh `railway.toml` và `render.yaml` (Nền tảng còn lại)
 
@@ -480,3 +500,4 @@ Theo quy định tại `RULES.md`:
 | **CP0** | Quét toàn bộ dự án, lập danh sách CP0–CP8 và kiểm tra điều kiện môi trường | Phát hiện tên repo lệch mẫu `SUBMISSION.md`, thiếu distro WSL2 Ubuntu trên máy Windows, và kiểm tra sẵn Docker/Python | Tự chạy `docker run --rm hello-world`, `python --version`, `wsl -l -v`, `gh repo view` để xác nhận môi trường thực tế |
 | **CP1–CP4** | Hướng dẫn chạy từng ví dụ `develop` / `production`, tổng hợp câu trả lời theo rubric | Các lệnh chạy thực tế, giải thích kiến trúc và bảng so sánh anti-patterns / Docker / JWT / Rate Limit / Stateless | Chạy trực tiếp từng app và Docker Compose stack (`-p k5-day14-docker`, `-p k5-day14-scaling`), đo dung lượng thật bằng `docker images` (`1.67GB` vs `240MB`), gọi `curl -i` thu 401/403/200/429 và chạy `test_stateless.py` xác nhận 3 instances + 10 messages trong Redis |
 | **CP5** | Hỗ trợ viết 12 file trong `06-lab-complete/` theo đúng hợp đồng 12 tiêu chí (không sửa `check_production_ready.py`) | Code hoàn chỉnh cho `app/*.py`, multi-stage `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml` | Chạy nguyên bản `check_production_ready.py` cả bản tĩnh (`28/28`), trên Windows (`42/42`, xác nhận `⚠️` chỉ do `os.name == 'nt'`) và trong container Linux POSIX có Docker CLI đạt **`PASS 12/12` (43/43 checks passed)** |
+| **CP6** | Cài `@railway/cli`, khởi tạo project Railway + Redis, cấu hình biến môi trường, deploy `06-lab-complete/`, so sánh `railway.toml`/`render.yaml` và phân tích Cloud Run | Project Railway `k5-day14-ai-agent` có public URL `https://agent-production-1f93d101.up.railway.app`, file `DEPLOYMENT.md`, mục Part 3 trong `MISSION_ANSWERS.md` | Tự xác thực đăng nhập Railway trên trình duyệt, chạy trực tiếp 4 lệnh tự kiểm CP6 (`200`, `200`, `401`, `200`), kiểm tra `/ready` kết nối Redis thật trên cloud và chạy `check_production_ready.py --public-url` |
