@@ -1,47 +1,202 @@
 """
-Production AI Agent — Part 6 Final Project (bản khung)
-
-Hoàn thành các TODO để đạt đủ 12 tiêu chí trong README.md, rồi kiểm tra:
-    python check_production_ready.py
-
-Bản khung này chạy được (uvicorn app.main:app) nhưng chưa đạt tiêu chí nào.
+Production AI Agent — Part 6 Final Project.
+Tích hợp: 12-Factor config, Structured JSON logging, Health/Readiness probes,
+API Key auth, Redis sliding-window rate limiter, Redis cost guard, Graceful shutdown.
 """
+import json
 import logging
+import sys
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app.auth import verify_api_key
+from app.config import settings
+from app.cost_guard import check_budget, record_cost
+from app.rate_limiter import check_rate_limit
+from app.redis_client import close_redis, redis_healthy
 from utils.mock_llm import ask as llm_ask
 
-# TODO (tiêu chí 10 — Structured logging):
-#   Mỗi dòng log của app phải là 1 JSON object hợp lệ, vd
-#   {"ts": "...", "lvl": "INFO", "event": "request", "path": "/ask", "status": 200, "ms": 12.3}
-#   Gợi ý: tự viết logging.Formatter dùng json.dumps.
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+_STANDARD_LOG_ATTRS = frozenset({
+    "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+    "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+    "created", "msecs", "relativeCreated", "thread", "threadName",
+    "processName", "process", "message", "taskName",
+})
 
-app = FastAPI(title="Production AI Agent")
+
+class JsonFormatter(logging.Formatter):
+    """Định dạng mỗi dòng log của app thành 1 JSON object hợp lệ."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "lvl": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key not in _STANDARD_LOG_ATTRS and not key.startswith("_"):
+                payload[key] = value
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _configure_logging() -> logging.Logger:
+    app_logger = logging.getLogger("app")
+    app_logger.setLevel(getattr(logging, settings.log_level, logging.INFO))
+    app_logger.handlers.clear()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    app_logger.addHandler(handler)
+    app_logger.propagate = False
+    return app_logger
+
+
+logger = _configure_logging()
+
+START_TIME = time.time()
+_shutting_down = False
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Quản lý vòng đời startup / graceful shutdown (SIGTERM)."""
+    global _shutting_down
+    _shutting_down = False
+    logger.info(
+        "Agent starting up",
+        extra={
+            "event": "startup",
+            "environment": settings.environment,
+            "port": settings.port,
+            "rate_limit_per_minute": settings.rate_limit_per_minute,
+        },
+    )
+    yield
+    _shutting_down = True
+    logger.info("Graceful shutdown initiated", extra={"event": "shutdown_start"})
+    close_redis()
+    logger.info("Graceful shutdown complete", extra={"event": "shutdown_complete"})
+
+
+app = FastAPI(
+    title="Production AI Agent",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs" if settings.environment != "production" else None,
+)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Ghi structured JSON log cho mọi HTTP request."""
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        logger.exception(
+            "Unhandled error while processing request",
+            extra={
+                "event": "request_error",
+                "method": request.method,
+                "path": request.url.path,
+                "ms": elapsed_ms,
+            },
+        )
+        raise
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    logger.info(
+        "HTTP request completed",
+        extra={
+            "event": "request",
+            "method": request.method,
+            "path": request.url.path,
+            "status": response.status_code,
+            "ms": elapsed_ms,
+        },
+    )
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Không lộ stack trace ra client khi có lỗi không mong muốn."""
+    logger.error(
+        "Internal server error",
+        extra={"event": "internal_error", "path": request.url.path, "error_type": type(exc).__name__},
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
+    user_id: Optional[str] = Field(default=None, max_length=128)
 
 
-# TODO (tiêu chí 4): GET /health — liveness: luôn trả 200 khi process còn chạy
-#                    (kể cả khi Redis chưa kết nối được)
-# TODO (tiêu chí 5): GET /ready  — readiness: 200 khi sẵn sàng, 503 khi Redis không kết nối được
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text.split()) * 2)
+
+
+@app.get("/health")
+def health():
+    """Liveness probe — luôn trả 200 khi process còn sống, kể cả khi Redis chưa kết nối."""
+    return {
+        "status": "ok",
+        "environment": settings.environment,
+        "uptime_seconds": round(time.time() - START_TIME, 1),
+    }
+
+
+@app.get("/ready")
+def ready():
+    """Readiness probe — 200 khi sẵn sàng, 503 khi Redis mất kết nối hoặc đang shutdown."""
+    if _shutting_down or not redis_healthy():
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready: Redis unavailable",
+        )
+    return {"status": "ready", "redis": "connected"}
 
 
 @app.post("/ask")
-def ask(body: AskRequest):
-    # TODO (tiêu chí 6): bắt buộc header X-API-Key → thêm Depends(verify_api_key)
-    # TODO (tiêu chí 7): check_rate_limit(...) → 429 khi vượt giới hạn
-    # TODO (tiêu chí 8): check_budget() trước khi gọi LLM, record_cost(...) sau khi gọi → 402 khi hết budget
+def ask(body: AskRequest, api_key: str = Depends(verify_api_key)):
+    """Protected endpoint: API key → Rate limit (Redis) → Cost guard (Redis) → LLM."""
+    rate_info = check_rate_limit(api_key)
+    check_budget()
+
     answer = llm_ask(body.question)
-    return {"question": body.question, "answer": answer}
 
+    input_tokens = _estimate_tokens(body.question)
+    output_tokens = _estimate_tokens(answer)
+    request_cost = record_cost(input_tokens, output_tokens)
 
-# TODO (tiêu chí 11 — Graceful shutdown):
-#   Khi nhận SIGTERM: ngừng nhận request mới, xử lý xong request đang chạy rồi thoát (exit code 0).
-#   Gợi ý: dùng lifespan của FastAPI để dọn dẹp. Nếu tự đăng ký signal handler cho SIGTERM thì
-#   phải gọi lại handler cũ của uvicorn, nếu không process sẽ không bao giờ tắt.
+    logger.info(
+        "Agent answered question",
+        extra={
+            "event": "ask_completed",
+            "question_len": len(body.question),
+            "answer_len": len(answer),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": round(request_cost, 8),
+        },
+    )
+    return {
+        "question": body.question,
+        "answer": answer,
+        "user_id": body.user_id,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": round(request_cost, 8),
+            "requests_remaining": rate_info["remaining"],
+        },
+    }
